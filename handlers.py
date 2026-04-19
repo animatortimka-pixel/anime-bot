@@ -1,204 +1,201 @@
-import random
-from typing import Any
+from __future__ import annotations
+
+import logging
+from collections import Counter
 
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from data import MEMES, QUOTES
 from db import AnimeDB
 from search import smart_search
-from ui import anime_card, anime_navigation_keyboard, genres_keyboard, main_menu_keyboard, rating_keyboard
+from ui import anime_card_text, anime_keyboard, genres_keyboard, main_menu_keyboard, rating_keyboard
+
+logger = logging.getLogger(__name__)
+
+SOURCE_MAP = {
+    "catalog": "catalog_items",
+    "top": "top_items",
+    "fav": "fav_items",
+    "reco": "reco_items",
+    "genre": "genre_items",
+    "search": "search_items",
+    "similar": "similar_items",
+}
 
 
-async def _show_menu(target, text: str = "👋 Выбери действие:") -> None:
-    await target.edit_message_text(text=text, reply_markup=main_menu_keyboard())
+async def build_recommendations(db: AnimeDB, user_id: int, limit: int = 12) -> list[dict]:
+    favorites = await db.get_user_favorites(user_id)
+    history = await db.get_user_history(user_id, limit=120)
+    pool = await db.get_all_anime()
+
+    watched_ids = {a["id"] for a in favorites + history}
+    preferred = Counter(g for a in favorites + history for g in a["genres"])
+    scored: list[tuple[float, dict]] = []
+    for anime in pool:
+        if anime["id"] in watched_ids:
+            continue
+        genre_score = sum(preferred[g] for g in anime["genres"])
+        total = genre_score * 2.0 + anime["views"] / 5000 + float(anime["rating"])
+        scored.append((total, anime))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [x[1] for x in scored[:limit]] if scored else (await db.get_popular(limit=limit))[:limit]
+
+
+async def _safe_edit(query, text: str, reply_markup, parse_mode: str | None = "HTML") -> None:
+    try:
+        await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except BadRequest as exc:
+        if "Message is not modified" not in str(exc):
+            raise
+
+
+async def _show_menu(query) -> None:
+    await _safe_edit(query, "👋 Добро пожаловать в Anime Hub. Выберите действие:", main_menu_keyboard())
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    db: AnimeDB = context.bot_data["db"]
+    await db.ensure_user(user.id, user.username)
     context.user_data.clear()
-    await update.message.reply_text(
-        "👋 Аниме-бот готов к работе. Всё управление через inline-кнопки.",
-        reply_markup=main_menu_keyboard(),
-    )
+    await update.message.reply_text("👋 Нажми кнопку ниже, чтобы открыть меню.", reply_markup=main_menu_keyboard())
 
 
-async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    db: AnimeDB = context.bot_data["db"]
     action = query.data.split(":", 1)[1]
+    db: AnimeDB = context.bot_data["db"]
+    user = update.effective_user
+    await db.ensure_user(user.id, user.username)
 
     if action == "home":
         await _show_menu(query)
-        return
-
-    if action == "search":
-        context.user_data["awaiting_search"] = True
-        await query.edit_message_text(
-            "🔎 Введите запрос сообщением (RU/EN, жанр, год, рейтинг). Например: <code>драма 2016 rating 8.5</code>",
-            reply_markup=main_menu_keyboard(),
-            parse_mode="HTML",
-        )
-        return
-
-    if action == "list":
-        items = await db.get_all_anime()
-        await _show_collection(query, context, "list", items, 0)
-        return
-
-    if action == "top":
-        items = await db.get_top(30)
-        await _show_collection(query, context, "top", items, 0)
-        return
-
-    if action == "genres":
+    elif action == "search":
+        context.user_data["await_search"] = True
+        context.user_data["search_anchor"] = (query.message.chat_id, query.message.message_id)
+        await _safe_edit(query, "🔍 Введите текстом запрос (RU/EN, жанр, год, рейтинг).", main_menu_keyboard())
+    elif action == "catalog":
+        context.user_data[SOURCE_MAP["catalog"]] = await db.get_all_anime()
+        await render_source(update, context, "catalog", 0)
+    elif action == "top":
+        context.user_data[SOURCE_MAP["top"]] = await db.get_popular(60)
+        await render_source(update, context, "top", 0)
+    elif action == "fav":
+        context.user_data[SOURCE_MAP["fav"]] = await db.get_user_favorites(user.id)
+        await render_source(update, context, "fav", 0)
+    elif action == "reco":
+        context.user_data[SOURCE_MAP["reco"]] = await build_recommendations(db, user.id, limit=50)
+        await render_source(update, context, "reco", 0)
+    elif action == "genres":
         genres = await db.get_genres()
-        context.user_data["genres"] = genres
-        await query.edit_message_text("🎭 Выберите жанр:", reply_markup=genres_keyboard(genres, page=0))
+        await _safe_edit(query, "🎭 Выберите жанр:", genres_keyboard(genres))
+    elif action == "quote":
+        await _safe_edit(query, f"💬 {await db.get_random_quote()}", main_menu_keyboard())
+    elif action == "meme":
+        await _safe_edit(query, f"😂 {await db.get_random_meme()}", main_menu_keyboard())
+    elif action == "random":
+        anime = await db.get_random_anime()
+        if anime:
+            context.user_data[SOURCE_MAP["catalog"]] = [anime]
+            await render_card(query, db, anime, "catalog", 0, 1)
+
+
+async def render_source(update: Update, context: ContextTypes.DEFAULT_TYPE, source: str, idx: int) -> None:
+    data = context.user_data.get(SOURCE_MAP[source], [])
+    if not data:
+        await _safe_edit(update.callback_query, "⚠️ Пусто. Попробуйте другой раздел.", main_menu_keyboard())
         return
+    idx = max(0, min(idx, len(data) - 1))
+    await render_card(update.callback_query, context.bot_data["db"], data[idx], source, idx, len(data))
 
-    if action == "favorites":
-        user_id = update.effective_user.id
-        items = await db.get_favorites(user_id)
-        if not items:
-            await query.edit_message_text("⭐ Избранное пока пусто.", reply_markup=main_menu_keyboard())
-            return
-        await _show_collection(query, context, "fav", items, 0)
+
+async def render_card(query, db: AnimeDB, anime: dict, source: str, idx: int, total: int) -> None:
+    await db.add_view(query.from_user.id, anime["id"])
+    avg = await db.get_average_rating(anime["id"])
+    await _safe_edit(query, anime_card_text(anime, avg), anime_keyboard(anime["id"], source, idx, total, anime["watch_urls"]))
+
+
+async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get("await_search"):
         return
-
-    if action == "rating":
-        await query.edit_message_text("📈 Выберите минимальный рейтинг:", reply_markup=rating_keyboard())
-        return
-
-    if action == "meme":
-        await query.edit_message_text(f"😂 {random.choice(MEMES)}", reply_markup=main_menu_keyboard())
-        return
-
-    if action == "quote":
-        await query.edit_message_text(f"💬 {random.choice(QUOTES)}", reply_markup=main_menu_keyboard())
-        return
-
-    if action == "random":
-        anime = await db.get_random()
-        if not anime:
-            await query.edit_message_text("База пуста.", reply_markup=main_menu_keyboard())
-            return
-        await query.edit_message_text(
-            anime_card(anime),
-            reply_markup=anime_navigation_keyboard("random", 0, 1, anime_id=anime["id"]),
-            parse_mode="HTML",
-        )
-
-
-async def on_search_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.user_data.get("awaiting_search"):
-        return
-
-    context.user_data["awaiting_search"] = False
     db: AnimeDB = context.bot_data["db"]
-    text = (update.message.text or "").strip()
-    if not text:
-        await update.message.reply_text("Введите не пустой запрос.", reply_markup=main_menu_keyboard())
-        return
+    query_text = (update.message.text or "").strip()
+    context.user_data["await_search"] = False
 
-    results = await smart_search(db, text, limit=30)
-    context.user_data["search_results"] = results
+    results = await smart_search(db, query_text, limit=50)
+    context.user_data[SOURCE_MAP["search"]] = results
+    chat_id, msg_id = context.user_data.get("search_anchor", (None, None))
+
+    if not chat_id or not msg_id:
+        await update.message.reply_text("Нажмите /start для меню.")
+        return
 
     if not results:
-        await update.message.reply_text("Ничего не найдено.", reply_markup=main_menu_keyboard())
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text="Ничего не найдено. Попробуйте другой запрос: название, жанр, год или рейтинг.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
-    await update.message.reply_text(
-        anime_card(results[0]),
-        reply_markup=anime_navigation_keyboard("search", 0, len(results), anime_id=results[0]["id"]),
+    anime = results[0]
+    avg = await db.get_average_rating(anime["id"])
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=msg_id,
+        text=anime_card_text(anime, avg),
+        reply_markup=anime_keyboard(anime["id"], "search", 0, len(results), anime["watch_urls"]),
         parse_mode="HTML",
     )
 
 
-async def on_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     db: AnimeDB = context.bot_data["db"]
+    user_id = update.effective_user.id
     parts = query.data.split(":")
 
     if parts[0] == "noop":
         return
-
-    if parts[0] == "fav" and parts[1] == "add":
-        anime_id = int(parts[2])
-        added = await db.add_favorite(update.effective_user.id, anime_id)
-        text = "⭐ Добавлено в избранное." if added else "⭐ Уже есть в избранном."
-        await query.answer(text, show_alert=False)
+    if parts[0] == "page":
+        await render_source(update, context, parts[1], int(parts[2]))
         return
-
+    if parts[0] == "fav":
+        added = await db.toggle_favorite(user_id, int(parts[2]))
+        await query.answer("Добавлено в избранное" if added else "Удалено из избранного")
+        return
+    if parts[0] == "rate" and parts[1] == "menu":
+        await _safe_edit(query, "⭐ Оцени аниме от 1 до 5:", rating_keyboard(int(parts[2]), parts[3], int(parts[4])))
+        return
+    if parts[0] == "rate" and parts[1] == "set":
+        anime_id, value, source, idx = int(parts[2]), int(parts[3]), parts[4], int(parts[5])
+        await db.set_rating(user_id, anime_id, value)
+        await query.answer(f"Ваша оценка: {value}")
+        await render_source(update, context, source, idx)
+        return
     if parts[0] == "genre":
-        genre = parts[1]
         all_items = await db.get_all_anime()
-        filtered = [a for a in all_items if genre in a["genres"].split(",")]
-        await _show_collection(query, context, "genre_items", filtered, 0)
+        context.user_data[SOURCE_MAP["genre"]] = [a for a in all_items if parts[1] in a["genres"]]
+        await render_source(update, context, "genre", 0)
         return
-
-    if parts[0] == "genres" and parts[1] == "page":
-        page = int(parts[2])
-        genres = context.user_data.get("genres", [])
-        await query.edit_message_text("🎭 Выберите жанр:", reply_markup=genres_keyboard(genres, page=page))
-        return
-
-    if parts[0] == "rating" and parts[1] == "min":
-        min_rating = float(parts[2])
+    if parts[0] == "sim":
+        anime = await db.get_anime(int(parts[1]))
+        if not anime:
+            await query.answer("Не найдено", show_alert=True)
+            return
         all_items = await db.get_all_anime()
-        filtered = [a for a in all_items if float(a["rating"]) >= min_rating]
-        await _show_collection(query, context, "rating_items", filtered, 0)
-        return
-
-    if len(parts) >= 3 and parts[1] == "page":
-        key = parts[0]
-        page = int(parts[2])
-        items = _resolve_collection(context.user_data, key)
-        await _show_collection(query, context, key, items, page)
-
-
-def _resolve_collection(store: dict[str, Any], key: str) -> list[dict[str, Any]]:
-    mapping = {
-        "list": "list_results",
-        "top": "top_results",
-        "fav": "fav_results",
-        "search": "search_results",
-        "genre_items": "genre_items",
-        "rating_items": "rating_items",
-    }
-    return store.get(mapping.get(key, ""), [])
-
-
-async def _show_collection(query, context: ContextTypes.DEFAULT_TYPE, key: str, items: list[dict[str, Any]], page: int) -> None:
-    if not items:
-        await query.edit_message_text("Пусто.", reply_markup=main_menu_keyboard())
-        return
-
-    mapping = {
-        "list": "list_results",
-        "top": "top_results",
-        "fav": "fav_results",
-        "search": "search_results",
-        "genre_items": "genre_items",
-        "rating_items": "rating_items",
-    }
-    store_key = mapping.get(key, key)
-    context.user_data[store_key] = items
-
-    page = max(0, min(page, len(items) - 1))
-    anime = items[page]
-
-    await query.edit_message_text(
-        anime_card(anime),
-        reply_markup=anime_navigation_keyboard(key, page, len(items), anime_id=anime["id"]),
-        parse_mode="HTML",
-    )
+        context.user_data[SOURCE_MAP["similar"]] = [a for a in all_items if a["id"] != anime["id"] and set(a["genres"]) & set(anime["genres"])][:50]
+        await render_source(update, context, "similar", 0)
 
 
 def setup_handlers(app: Application, db: AnimeDB) -> None:
     app.bot_data["db"] = db
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(on_menu_callback, pattern=r"^menu:"))
-    app.add_handler(CallbackQueryHandler(on_nav_callback, pattern=r"^(?!menu:).+"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_search_message))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^(?!menu:).+"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_search))
