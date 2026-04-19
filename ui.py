@@ -6,54 +6,92 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔍 Поиск", callback_data="menu:search"), InlineKeyboardButton("🎲 Случайное", callback_data="menu:random"), InlineKeyboardButton("📚 Каталог", callback_data="menu:catalog")],
-            [InlineKeyboardButton("🏆 Топ", callback_data="menu:top"), InlineKeyboardButton("🎯 Рекомендации", callback_data="menu:reco"), InlineKeyboardButton("🎭 Жанры", callback_data="menu:genres")],
-            [InlineKeyboardButton("❤️ Избранное", callback_data="menu:fav"), InlineKeyboardButton("💬 Цитата", callback_data="menu:quote"), InlineKeyboardButton("😂 Мем", callback_data="menu:meme")],
+            [InlineKeyboardButton("🔍 Поиск", callback_data="menu_search"), InlineKeyboardButton("❤️ Избранное", callback_data="menu_favorites")],
+            [InlineKeyboardButton("🎲 Случайное", callback_data="menu_random"), InlineKeyboardButton("🏆 Топ", callback_data="menu_top")],
+            [InlineKeyboardButton("🎭 Жанры", callback_data="menu_genres"), InlineKeyboardButton("ℹ️ Помощь", callback_data="menu_help")],
         ]
     )
 
 
-def anime_card_text(anime: dict, avg_user_rating: float = 0.0) -> str:
-    user_rating = f"\n👥 Пользовательский рейтинг: {avg_user_rating:.2f}/5" if avg_user_rating else ""
+def anime_card(anime_data: dict) -> str:
+    watch_count = anime_data.get("views", 0)
     return (
-        f"🎬 <b>{anime['name_ru']}</b> / <i>{anime['name_en']}</i>\n"
-        f"🗓 Год: {anime['year']} | 🎞 Эпизодов: {anime['episodes']}\n"
-        f"⭐ База: {anime['rating']}/10{user_rating}\n"
-        f"🏷 Жанры: {', '.join(anime['genres'])}\n"
-        f"👁 Просмотры: {anime['views']}\n\n"
-        f"📖 {anime['description']}"
+        f"🎬 <b>{anime_data['name_ru']}</b>\n"
+        f"<i>{anime_data['name_en']}</i>\n\n"
+        f"🗓 Год: <b>{anime_data['year']}</b>\n"
+        f"⭐ Рейтинг: <b>{anime_data['rating']:.2f}</b>\n"
+        f"🎞 Эпизоды: <b>{anime_data['episodes']}</b>\n"
+        f"🏷 Жанры: {', '.join(anime_data['genres'])}\n"
+        f"👁 Просмотры: {watch_count}\n\n"
+        f"📖 {anime_data['description']}"
     )
 
 
-def anime_keyboard(anime_id: int, source: str, idx: int, total: int, watch_urls: list[str]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(f"▶️ Смотреть {i+1}", url=u) for i, u in enumerate(watch_urls[:2])],
-        [InlineKeyboardButton("⭐ Оценить", callback_data=f"rate:menu:{anime_id}:{source}:{idx}"), InlineKeyboardButton("❤️ В избранное", callback_data=f"fav:toggle:{anime_id}")],
-        [InlineKeyboardButton("📋 Похожие", callback_data=f"sim:{anime_id}"), InlineKeyboardButton("🎲 Случайное", callback_data="menu:random")],
-    ]
-    nav = []
+def anime_actions_keyboard(anime_id: int, source: str = "m", idx: int = 0, total: int = 1) -> InlineKeyboardMarkup:
+    nav_row = []
     if idx > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page:{source}:{idx-1}"))
-    nav.append(InlineKeyboardButton(f"{idx+1}/{max(total,1)}", callback_data="noop"))
+        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"anime_nav_{source}_{idx-1}"))
+    nav_row.append(InlineKeyboardButton(f"{idx + 1}/{total}", callback_data="noop"))
     if idx < total - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"page:{source}:{idx+1}"))
-    rows.append(nav)
-    rows.append([InlineKeyboardButton("🏠 Меню", callback_data="menu:home")])
-    return InlineKeyboardMarkup(rows)
+        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"anime_nav_{source}_{idx+1}"))
 
-
-def rating_keyboard(anime_id: int, source: str, idx: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(str(v), callback_data=f"rate:set:{anime_id}:{v}:{source}:{idx}") for v in range(1, 6)],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=f"page:{source}:{idx}")],
+            [InlineKeyboardButton("▶️ Смотреть", callback_data=f"watch_menu_{anime_id}"), InlineKeyboardButton("📺 Серии", callback_data=f"series_page_{anime_id}_0")],
+            [InlineKeyboardButton("❤️ В избранное", callback_data=f"add_fav_{anime_id}"), InlineKeyboardButton("📋 Похожие", callback_data=f"similar_{anime_id}")],
+            [InlineKeyboardButton("⭐ Оценить", callback_data=f"rate_menu_{anime_id}"), InlineKeyboardButton("🏠 Меню", callback_data="menu_home")],
+            nav_row,
+        ]
+    )
+
+
+def watch_keyboard(anime_id: int, watch_urls: dict[str, str]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("▶️ Anilibria", url=watch_urls.get("anilibria", "https://www.anilibria.tv/"))],
+            [InlineKeyboardButton("📖 Shikimori", url=watch_urls.get("shikimori", "https://shikimori.one/"))],
+            [InlineKeyboardButton("🎥 YouTube", url=watch_urls.get("youtube", "https://www.youtube.com/"))],
+            [InlineKeyboardButton("📺 Серии", callback_data=f"series_page_{anime_id}_0")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"anime_view_{anime_id}")],
+        ]
+    )
+
+
+def rating_keyboard(anime_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(str(v), callback_data=f"rate_{anime_id}_{v}") for v in range(1, 6)],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"anime_view_{anime_id}")],
         ]
     )
 
 
 def genres_keyboard(genres: list[str]) -> InlineKeyboardMarkup:
     rows = []
-    for i in range(0, len(genres), 3):
-        rows.append([InlineKeyboardButton(f"#{g}", callback_data=f"genre:{g}") for g in genres[i : i + 3]])
-    rows.append([InlineKeyboardButton("🏠 Меню", callback_data="menu:home")])
+    for i in range(0, len(genres), 2):
+        rows.append([InlineKeyboardButton(genres[i], callback_data=f"genre_{genres[i]}")] + ([InlineKeyboardButton(genres[i + 1], callback_data=f"genre_{genres[i + 1]}")] if i + 1 < len(genres) else []))
+    rows.append([InlineKeyboardButton("🏠 Меню", callback_data="menu_home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def series_page_keyboard(anime_id: int, episodes_data: dict[str, str], page: int) -> InlineKeyboardMarkup:
+    episode_numbers = sorted((int(k) for k in episodes_data.keys()), key=lambda x: x)
+    per_page = 10
+    total_pages = max(1, (len(episode_numbers) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * per_page
+    current = episode_numbers[start : start + per_page]
+
+    rows = [[InlineKeyboardButton(f"Серия {ep}", callback_data=f"episode_{anime_id}_{ep}_{page}")] for ep in current]
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"series_page_{anime_id}_{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"series_page_{anime_id}_{page+1}"))
+    rows.append(nav)
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"anime_view_{anime_id}")])
     return InlineKeyboardMarkup(rows)

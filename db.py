@@ -2,15 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
-import random
 import sqlite3
 from pathlib import Path
 from typing import Any
 
-from data import ANIME_DATA, MEMES, QUOTES
-
-logger = logging.getLogger(__name__)
+from data import fill_data
 
 
 class AnimeDB:
@@ -39,9 +35,10 @@ class AnimeDB:
                     year INTEGER NOT NULL,
                     description TEXT NOT NULL,
                     genres TEXT NOT NULL,
-                    rating REAL NOT NULL,
+                    rating REAL NOT NULL DEFAULT 0,
                     episodes INTEGER NOT NULL,
                     watch_urls TEXT NOT NULL,
+                    episodes_data TEXT NOT NULL,
                     views INTEGER NOT NULL DEFAULT 0
                 );
 
@@ -54,6 +51,7 @@ class AnimeDB:
                 CREATE TABLE IF NOT EXISTS favorites (
                     user_id INTEGER NOT NULL,
                     anime_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (user_id, anime_id),
                     FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
                     FOREIGN KEY (anime_id) REFERENCES anime(id) ON DELETE CASCADE
@@ -70,6 +68,7 @@ class AnimeDB:
                 );
 
                 CREATE TABLE IF NOT EXISTS history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
                     anime_id INTEGER NOT NULL,
                     viewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -77,15 +76,11 @@ class AnimeDB:
                     FOREIGN KEY (anime_id) REFERENCES anime(id) ON DELETE CASCADE
                 );
 
-                CREATE TABLE IF NOT EXISTS quotes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    text TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS memes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    text TEXT NOT NULL
-                );
+                CREATE INDEX IF NOT EXISTS idx_anime_year ON anime(year);
+                CREATE INDEX IF NOT EXISTS idx_anime_rating ON anime(rating DESC);
+                CREATE INDEX IF NOT EXISTS idx_anime_views ON anime(views DESC);
+                CREATE INDEX IF NOT EXISTS idx_favorites_user_created ON favorites(user_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_ratings_anime_user ON ratings(anime_id, user_id);
 
                 CREATE VIRTUAL TABLE IF NOT EXISTS anime_fts USING fts5(
                     name_ru,
@@ -102,11 +97,6 @@ class AnimeDB:
                     VALUES (new.id, new.name_ru, new.name_en, new.description, new.genres);
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS anime_ad AFTER DELETE ON anime BEGIN
-                    INSERT INTO anime_fts(anime_fts, rowid, name_ru, name_en, description, genres)
-                    VALUES ('delete', old.id, old.name_ru, old.name_en, old.description, old.genres);
-                END;
-
                 CREATE TRIGGER IF NOT EXISTS anime_au AFTER UPDATE ON anime BEGIN
                     INSERT INTO anime_fts(anime_fts, rowid, name_ru, name_en, description, genres)
                     VALUES ('delete', old.id, old.name_ru, old.name_en, old.description, old.genres);
@@ -114,40 +104,39 @@ class AnimeDB:
                     VALUES (new.id, new.name_ru, new.name_en, new.description, new.genres);
                 END;
 
-                CREATE INDEX IF NOT EXISTS idx_anime_year ON anime(year);
-                CREATE INDEX IF NOT EXISTS idx_anime_rating ON anime(rating DESC);
-                CREATE INDEX IF NOT EXISTS idx_anime_views ON anime(views DESC);
-                CREATE INDEX IF NOT EXISTS idx_fav_user ON favorites(user_id);
-                CREATE INDEX IF NOT EXISTS idx_rating_anime ON ratings(anime_id);
-                CREATE INDEX IF NOT EXISTS idx_history_user_date ON history(user_id, viewed_at DESC);
+                CREATE TRIGGER IF NOT EXISTS anime_ad AFTER DELETE ON anime BEGIN
+                    INSERT INTO anime_fts(anime_fts, rowid, name_ru, name_en, description, genres)
+                    VALUES ('delete', old.id, old.name_ru, old.name_en, old.description, old.genres);
+                END;
                 """
             )
             if conn.execute("SELECT COUNT(*) FROM anime").fetchone()[0] == 0:
+                seed = []
+                for row in fill_data():
+                    seed.append(
+                        {
+                            **row,
+                            "genres": ",".join(row["genres"]),
+                            "watch_urls": json.dumps(row["watch_urls"], ensure_ascii=False),
+                            "episodes_data": json.dumps(row["episodes_data"], ensure_ascii=False),
+                        }
+                    )
                 conn.executemany(
                     """
-                    INSERT INTO anime(name_ru, name_en, year, description, genres, rating, episodes, watch_urls, views)
-                    VALUES (:name_ru,:name_en,:year,:description,:genres,:rating,:episodes,:watch_urls,:views)
+                    INSERT INTO anime(name_ru, name_en, year, description, genres, rating, episodes, watch_urls, episodes_data, views)
+                    VALUES (:name_ru,:name_en,:year,:description,:genres,:rating,:episodes,:watch_urls,:episodes_data,:views)
                     """,
-                    [
-                        {
-                            **item,
-                            "genres": ",".join(item["genres"]),
-                            "watch_urls": json.dumps(item["watch_urls"], ensure_ascii=False),
-                        }
-                        for item in ANIME_DATA
-                    ],
+                    seed,
                 )
-            if conn.execute("SELECT COUNT(*) FROM quotes").fetchone()[0] == 0:
-                conn.executemany("INSERT INTO quotes(text) VALUES (?)", [(q,) for q in QUOTES])
-            if conn.execute("SELECT COUNT(*) FROM memes").fetchone()[0] == 0:
-                conn.executemany("INSERT INTO memes(text) VALUES (?)", [(m,) for m in MEMES])
-            conn.commit()
-            logger.info("Database initialized")
+                conn.commit()
 
-    def _row_to_anime(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _row_to_anime(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
         item = dict(row)
         item["genres"] = [x.strip() for x in item["genres"].split(",") if x.strip()]
-        item["watch_urls"] = json.loads(item["watch_urls"] or "[]")
+        item["watch_urls"] = json.loads(item["watch_urls"])
+        item["episodes_data"] = json.loads(item["episodes_data"])
         return item
 
     async def ensure_user(self, user_id: int, username: str | None) -> None:
@@ -156,10 +145,7 @@ class AnimeDB:
     def _ensure_user_sync(self, user_id: int, username: str | None) -> None:
         with self._connect() as conn:
             conn.execute(
-                """
-                INSERT INTO users(user_id, username) VALUES (?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET username=excluded.username
-                """,
+                "INSERT INTO users(user_id, username) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
                 (user_id, username),
             )
             conn.commit()
@@ -169,78 +155,30 @@ class AnimeDB:
 
     def _get_anime_sync(self, anime_id: int) -> dict[str, Any] | None:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM anime WHERE id=?", (anime_id,)).fetchone()
-            return self._row_to_anime(row) if row else None
+            return self._row_to_anime(conn.execute("SELECT * FROM anime WHERE id=?", (anime_id,)).fetchone())
 
     async def get_all_anime(self) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._get_all_anime_sync)
 
     def _get_all_anime_sync(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM anime ORDER BY id").fetchall()
-            return [self._row_to_anime(r) for r in rows]
+            rows = conn.execute("SELECT * FROM anime ORDER BY rating DESC, views DESC, id ASC").fetchall()
+            return [self._row_to_anime(row) for row in rows if row is not None]
 
-    async def search_fts(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._search_fts_sync, query, limit)
+    async def get_popular(self, limit: int = 30) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._get_popular_sync, limit)
 
-    def _search_fts_sync(self, query: str, limit: int) -> list[dict[str, Any]]:
+    def _get_popular_sync(self, limit: int) -> list[dict[str, Any]]:
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT a.*, bm25(anime_fts, 12.0, 10.0, 3.0, 7.0) AS bm
-                FROM anime_fts
-                JOIN anime a ON a.id=anime_fts.rowid
-                WHERE anime_fts MATCH ?
-                ORDER BY bm
-                LIMIT ?
-                """,
-                (query, limit),
-            ).fetchall()
-            result = []
-            for row in rows:
-                anime = self._row_to_anime(row)
-                anime["bm25"] = row["bm"]
-                result.append(anime)
-            return result
+            rows = conn.execute("SELECT * FROM anime ORDER BY views DESC, rating DESC LIMIT ?", (limit,)).fetchall()
+            return [self._row_to_anime(row) for row in rows if row is not None]
 
-    async def add_view(self, user_id: int, anime_id: int) -> None:
-        await asyncio.to_thread(self._add_view_sync, user_id, anime_id)
+    async def get_random_anime(self) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_random_anime_sync)
 
-    def _add_view_sync(self, user_id: int, anime_id: int) -> None:
+    def _get_random_anime_sync(self) -> dict[str, Any] | None:
         with self._connect() as conn:
-            conn.execute("INSERT INTO history(user_id, anime_id) VALUES (?,?)", (user_id, anime_id))
-            conn.execute("UPDATE anime SET views = views + 1 WHERE id=?", (anime_id,))
-            conn.commit()
-
-    async def toggle_favorite(self, user_id: int, anime_id: int) -> bool:
-        return await asyncio.to_thread(self._toggle_favorite_sync, user_id, anime_id)
-
-    def _toggle_favorite_sync(self, user_id: int, anime_id: int) -> bool:
-        with self._connect() as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM favorites WHERE user_id=? AND anime_id=?", (user_id, anime_id)
-            ).fetchone()
-            if exists:
-                conn.execute("DELETE FROM favorites WHERE user_id=? AND anime_id=?", (user_id, anime_id))
-                conn.commit()
-                return False
-            conn.execute("INSERT INTO favorites(user_id, anime_id) VALUES (?,?)", (user_id, anime_id))
-            conn.commit()
-            return True
-
-    async def set_rating(self, user_id: int, anime_id: int, value: int) -> None:
-        await asyncio.to_thread(self._set_rating_sync, user_id, anime_id, value)
-
-    def _set_rating_sync(self, user_id: int, anime_id: int, value: int) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO ratings(user_id, anime_id, rating) VALUES (?, ?, ?)
-                ON CONFLICT(user_id, anime_id) DO UPDATE SET rating=excluded.rating, rated_at=CURRENT_TIMESTAMP
-                """,
-                (user_id, anime_id, value),
-            )
-            conn.commit()
+            return self._row_to_anime(conn.execute("SELECT * FROM anime ORDER BY RANDOM() LIMIT 1").fetchone())
 
     async def get_user_favorites(self, user_id: int) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._get_user_favorites_sync, user_id)
@@ -249,82 +187,86 @@ class AnimeDB:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT a.* FROM favorites f JOIN anime a ON a.id=f.anime_id
-                WHERE f.user_id=? ORDER BY a.rating DESC, a.views DESC
+                SELECT a.*
+                FROM favorites f
+                JOIN anime a ON a.id = f.anime_id
+                WHERE f.user_id=?
+                ORDER BY f.created_at DESC
                 """,
                 (user_id,),
             ).fetchall()
-            return [self._row_to_anime(r) for r in rows]
+            return [self._row_to_anime(row) for row in rows if row is not None]
 
-    async def get_user_history(self, user_id: int, limit: int = 100) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._get_user_history_sync, user_id, limit)
+    async def toggle_favorite(self, user_id: int, anime_id: int) -> bool:
+        return await asyncio.to_thread(self._toggle_favorite_sync, user_id, anime_id)
 
-    def _get_user_history_sync(self, user_id: int, limit: int) -> list[dict[str, Any]]:
+    def _toggle_favorite_sync(self, user_id: int, anime_id: int) -> bool:
         with self._connect() as conn:
-            rows = conn.execute(
+            exists = conn.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND anime_id=?",
+                (user_id, anime_id),
+            ).fetchone()
+            if exists:
+                conn.execute("DELETE FROM favorites WHERE user_id=? AND anime_id=?", (user_id, anime_id))
+                conn.commit()
+                return False
+            conn.execute("INSERT INTO favorites(user_id, anime_id) VALUES (?, ?)", (user_id, anime_id))
+            conn.commit()
+            return True
+
+    async def set_rating(self, user_id: int, anime_id: int, rating_value: int) -> float:
+        return await asyncio.to_thread(self._set_rating_sync, user_id, anime_id, rating_value)
+
+    def _set_rating_sync(self, user_id: int, anime_id: int, rating_value: int) -> float:
+        with self._connect() as conn:
+            conn.execute(
                 """
-                SELECT a.* FROM history h JOIN anime a ON a.id=h.anime_id
-                WHERE h.user_id=? ORDER BY h.viewed_at DESC LIMIT ?
+                INSERT INTO ratings(user_id, anime_id, rating)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id, anime_id)
+                DO UPDATE SET rating=excluded.rating, rated_at=CURRENT_TIMESTAMP
                 """,
-                (user_id, limit),
-            ).fetchall()
-            return [self._row_to_anime(r) for r in rows]
+                (user_id, anime_id, rating_value),
+            )
+            row = conn.execute("SELECT AVG(rating) AS avg_rating FROM ratings WHERE anime_id=?", (anime_id,)).fetchone()
+            avg_rating = float(row["avg_rating"]) if row and row["avg_rating"] is not None else 0.0
+            conn.execute("UPDATE anime SET rating=? WHERE id=?", (round(avg_rating, 2), anime_id))
+            conn.commit()
+            return round(avg_rating, 2)
 
-    async def get_popular(self, limit: int = 50) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._get_popular_sync, limit)
+    async def add_view(self, user_id: int, anime_id: int) -> None:
+        await asyncio.to_thread(self._add_view_sync, user_id, anime_id)
 
-    def _get_popular_sync(self, limit: int) -> list[dict[str, Any]]:
+    def _add_view_sync(self, user_id: int, anime_id: int) -> None:
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT a.*, COALESCE(AVG(r.rating), 0) AS user_rating
-                FROM anime a
-                LEFT JOIN ratings r ON r.anime_id=a.id
-                GROUP BY a.id
-                ORDER BY a.views DESC, user_rating DESC, a.rating DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-            out = []
-            for r in rows:
-                anime = self._row_to_anime(r)
-                anime["user_rating"] = r["user_rating"]
-                out.append(anime)
-            return out
-
-    async def get_top_rated(self, limit: int = 50) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._get_top_rated_sync, limit)
-
-    def _get_top_rated_sync(self, limit: int) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM anime ORDER BY rating DESC, views DESC LIMIT ?", (limit,)).fetchall()
-            return [self._row_to_anime(r) for r in rows]
+            conn.execute("INSERT INTO history(user_id, anime_id) VALUES (?, ?)", (user_id, anime_id))
+            conn.execute("UPDATE anime SET views = views + 1 WHERE id=?", (anime_id,))
+            conn.commit()
 
     async def get_genres(self) -> list[str]:
-        animes = await self.get_all_anime()
-        genres = sorted({g for a in animes for g in a["genres"]})
-        return genres
-
-    async def get_average_rating(self, anime_id: int) -> float:
-        return await asyncio.to_thread(self._get_average_rating_sync, anime_id)
-
-    def _get_average_rating_sync(self, anime_id: int) -> float:
-        with self._connect() as conn:
-            row = conn.execute("SELECT AVG(rating) as avg_rating FROM ratings WHERE anime_id=?", (anime_id,)).fetchone()
-            return round(float(row["avg_rating"]), 2) if row and row["avg_rating"] else 0.0
-
-    async def get_random_anime(self) -> dict[str, Any] | None:
         all_items = await self.get_all_anime()
-        return random.choice(all_items) if all_items else None
+        return sorted({genre for item in all_items for genre in item["genres"]})
 
-    async def get_random_quote(self) -> str:
-        return await asyncio.to_thread(self._get_random_text_sync, "quotes")
+    async def search_fts(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._search_fts_sync, query, limit)
 
-    async def get_random_meme(self) -> str:
-        return await asyncio.to_thread(self._get_random_text_sync, "memes")
-
-    def _get_random_text_sync(self, table: str) -> str:
+    def _search_fts_sync(self, query: str, limit: int) -> list[dict[str, Any]]:
         with self._connect() as conn:
-            row = conn.execute(f"SELECT text FROM {table} ORDER BY RANDOM() LIMIT 1").fetchone()
-            return row["text"] if row else "Пока пусто."
+            rows = conn.execute(
+                """
+                SELECT a.*, -bm25(anime_fts, 12.0, 10.0, 4.0, 6.0) AS rank_score
+                FROM anime_fts
+                JOIN anime a ON a.id = anime_fts.rowid
+                WHERE anime_fts MATCH ?
+                ORDER BY rank_score DESC
+                LIMIT ?
+                """,
+                (query, limit),
+            ).fetchall()
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                anime = self._row_to_anime(row)
+                if anime is not None:
+                    anime["rank"] = float(row["rank_score"])
+                    out.append(anime)
+            return out
